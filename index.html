@@ -1,0 +1,432 @@
+<!--
+  Implementation Plan:
+  1. Bootstrap a single HTML file with Kaboom.js CDN (v3000.0.1), Web Audio API oscillator helpers for SFX
+     (jump / coin / gameover tones), and a microphone AnalyserNode for volume-spike jump detection wired to
+     a user-gesture "Enable Mic" button overlay so AudioContext is unlocked correctly on mobile.
+  2. Initialize Kaboom with full-viewport stretch canvas, declare layout constants (ground Y, player X, base
+     speed), then register three scenes: "menu" (title + high score), "game" (runner logic), "gameover" (result).
+  3. Inside the "game" scene, place a static wizard emoji player with body()+area() physics on a wide isStatic
+     ground rect; spawn scrolling emoji enemies (🍄 / 🐢) and coins (🪙) with recursive wait() for random
+     intervals; manually advance each object leftward in onUpdate() so speed always reflects the current value.
+  4. Wire Space, onClick, and mic-volume-threshold (checked each onUpdate frame) to player.jump(); escalate
+     scroll speed with elapsed time; accumulate score per frame plus coin pickups; save high score to
+     localStorage; transition to "gameover" scene 0.7 s after enemy collision.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Wizard Runner</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; touch-action: none; background: #38bdf8; }
+    canvas { display: block; }
+    #mic-btn {
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, 72px);
+      padding: 14px 30px;
+      font-size: 18px; font-weight: bold; font-family: monospace;
+      background: #fbbf24; color: #111;
+      border: none; border-radius: 10px; cursor: pointer;
+      z-index: 200;
+      box-shadow: 0 4px 14px rgba(0,0,0,.4);
+      transition: background 0.3s;
+    }
+    #mic-status {
+      position: fixed;
+      bottom: 18px; left: 50%;
+      transform: translateX(-50%);
+      color: #fff; font-size: 14px; font-family: monospace;
+      z-index: 200;
+      text-shadow: 1px 1px 3px #000;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+
+<button id="mic-btn">🎤 Enable Mic Jump</button>
+<div id="mic-status"></div>
+
+<script src="https://unpkg.com/kaboom@3000.0.1/dist/kaboom.js"></script>
+<script>
+"use strict";
+
+// ─── Web Audio ────────────────────────────────────────────────────────────────
+let _audioCtx   = null;
+let _analyser   = null;
+let micActive   = false;
+let micCooldown = false;
+
+function getACtx() {
+  if (!_audioCtx) _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (_audioCtx.state === "suspended") _audioCtx.resume();
+  return _audioCtx;
+}
+
+function sfx(kind) {
+  try {
+    const ac = getACtx(), osc = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+    osc.connect(g); g.connect(ac.destination);
+    switch (kind) {
+      case "jump":
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(260, t);
+        osc.frequency.exponentialRampToValueAtTime(520, t + 0.13);
+        g.gain.setValueAtTime(0.22, t);
+        g.gain.linearRampToValueAtTime(0, t + 0.17);
+        osc.start(t); osc.stop(t + 0.17);
+        break;
+      case "coin":
+        osc.type = "triangle";
+        osc.frequency.setValueAtTime(880, t);
+        osc.frequency.exponentialRampToValueAtTime(1320, t + 0.07);
+        g.gain.setValueAtTime(0.28, t);
+        g.gain.linearRampToValueAtTime(0, t + 0.11);
+        osc.start(t); osc.stop(t + 0.11);
+        break;
+      case "die":
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(440, t);
+        osc.frequency.exponentialRampToValueAtTime(110, t + 0.55);
+        g.gain.setValueAtTime(0.30, t);
+        g.gain.linearRampToValueAtTime(0, t + 0.65);
+        osc.start(t); osc.stop(t + 0.65);
+        break;
+    }
+  } catch(_) {}
+}
+
+async function enableMic() {
+  try {
+    const ac     = getACtx();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    const src    = ac.createMediaStreamSource(stream);
+    _analyser    = ac.createAnalyser();
+    _analyser.fftSize = 512;
+    src.connect(_analyser);
+    micActive = true;
+    document.getElementById("mic-status").textContent = "🎤 Active — Clap / shout to jump!";
+    const btn = document.getElementById("mic-btn");
+    btn.textContent = "✅ Mic Enabled";
+    btn.style.background = "#4ade80";
+  } catch(_) {
+    document.getElementById("mic-status").textContent = "❌ Mic denied — use Space / Tap";
+  }
+}
+
+function getMicVol() {
+  if (!_analyser) return 0;
+  const buf = new Uint8Array(_analyser.frequencyBinCount);
+  _analyser.getByteTimeDomainData(buf);
+  let rms = 0;
+  for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; rms += v * v; }
+  return Math.sqrt(rms / buf.length);
+}
+
+document.getElementById("mic-btn").addEventListener("click", e => {
+  e.stopPropagation();
+  enableMic();
+});
+
+// ─── Kaboom Init ─────────────────────────────────────────────────────────────
+kaboom({
+  width:      window.innerWidth,
+  height:     window.innerHeight,
+  background: [56, 189, 248],
+  stretch:    true,
+  letterbox:  false,
+});
+
+const W        = width();
+const H        = height();
+const GY       = H - 80;   // ground top Y
+const GH       = 80;
+const PLAYER_X = 130;
+const BASE_SPD = 280;
+const HS_KEY   = "wzr_hs_v1";
+
+function getHS()   { return parseInt(localStorage.getItem(HS_KEY) || "0"); }
+function saveHS(s) { if (s > getHS()) localStorage.setItem(HS_KEY, String(s)); }
+function showMicBtn() { document.getElementById("mic-btn").style.display = "block"; }
+function hideMicBtn() { document.getElementById("mic-btn").style.display = "none";  }
+
+// ─── Menu Scene ──────────────────────────────────────────────────────────────
+scene("menu", () => {
+  showMicBtn();
+
+  // Ground
+  add([rect(W, GH + 20), pos(0, GY), color(74, 222, 128)]);
+  add([rect(W, 10),       pos(0, GY), color(34, 197, 94)]);
+
+  // Decorative hills
+  const hc = [[52,211,153],[34,197,94],[74,222,128]];
+  for (let i = 0; i < 5; i++) {
+    const c = hc[i % hc.length];
+    add([circle(50 + (i % 3) * 14), pos(80 + i * 185, GY + 14),
+         color(c[0], c[1], c[2]), z(-1)]);
+  }
+
+  // Wizard
+  add([text("🧙‍♂️", { size: 92 }), pos(W/2, H/2 - 148), anchor("center"), z(5)]);
+
+  // Title
+  const titleSz = Math.min(50, W / 12);
+  add([text("WIZARD  RUNNER", { size: titleSz, font: "monospace" }),
+       pos(W/2, H/2 - 56), anchor("center"), color(255, 255, 255), z(5)]);
+
+  add([text("Avoid  🍄  🐢     Collect  🪙", { size: 18, font: "monospace" }),
+       pos(W/2, H/2 + 8), anchor("center"), color(240, 240, 80), z(5)]);
+
+  add([text("High Score: " + getHS(), { size: 22, font: "monospace" }),
+       pos(W/2, H/2 + 52), anchor("center"), color(255, 215, 0), z(5)]);
+
+  add([text("▶  TAP  or  SPACE  to  Start", { size: 19, font: "monospace" }),
+       pos(W/2, H/2 + 98), anchor("center"), color(255, 255, 255), z(5)]);
+
+  const start = () => { hideMicBtn(); go("game"); };
+  onKeyPress("space", start);
+  onClick(start);
+});
+
+// ─── Game Scene ──────────────────────────────────────────────────────────────
+scene("game", () => {
+  hideMicBtn();
+  setGravity(1900);
+
+  let score   = 0;
+  let elapsed = 0;
+  let alive   = true;
+  let spd     = BASE_SPD;
+
+  // Static ground platform (physics)
+  add([
+    rect(W * 8, GH + 60),
+    pos(-W * 3, GY),
+    color(74, 222, 128),
+    area(),
+    body({ isStatic: true }),
+  ]);
+
+  // Dark top edge (visual only)
+  add([rect(W, 10), pos(0, GY), color(34, 197, 94)]);
+
+  // Scrolling grass tufts (visual decoration)
+  const TUFT_N = 10;
+  const tufts = [];
+  for (let i = 0; i < TUFT_N; i++) {
+    tufts.push(add([
+      rect(10, 20),
+      pos(i * (W / (TUFT_N - 1)), GY - 8),
+      color(34, 197, 94),
+    ]));
+  }
+
+  // Background hills (static decoration)
+  for (let i = 0; i < 4; i++)
+    add([circle(58 + i * 12), pos(90 + i * 230, GY - 6), color(167, 243, 208), z(-1)]);
+
+  // --- Player ---
+  const player = add([
+    text("🧙‍♂️", { size: 60 }),
+    pos(PLAYER_X, GY - 6),
+    anchor("bot"),
+    area(),
+    body(),
+    z(10),
+  ]);
+
+  function doJump() {
+    if (!alive) return;
+    if (player.isGrounded()) {
+      player.jump(790);
+      sfx("jump");
+    }
+  }
+
+  onKeyPress("space", doJump);
+  onClick(doJump);
+
+  // Mic volume check each frame
+  onUpdate(() => {
+    if (!alive || !micActive || micCooldown) return;
+    if (getMicVol() > 0.16) {
+      doJump();
+      micCooldown = true;
+      setTimeout(() => { micCooldown = false; }, 650);
+    }
+  });
+
+  // --- Clouds ---
+  function spawnCloud() {
+    add([
+      text("☁️", { size: rand(30, 68) }),
+      pos(W + 90, rand(18, GY - 170)),
+      "cloud",
+      { cspd: rand(40, 85) },
+    ]);
+  }
+  loop(2.5, spawnCloud);
+  spawnCloud(); spawnCloud();
+
+  onUpdate("cloud", c => {
+    c.pos.x -= c.cspd * dt();
+    if (c.pos.x < -130) destroy(c);
+  });
+
+  // --- Enemies ---
+  const ENEMY_EMOJIS = ["🍄", "🐢"];
+
+  function spawnEnemy() {
+    if (!alive) return;
+    const em = choose(ENEMY_EMOJIS);
+    const sz = em === "🍄" ? 44 : 50;
+    add([
+      text(em, { size: sz }),
+      pos(W + 90, GY - 4),
+      anchor("bot"),
+      area(),
+      "enemy",
+    ]);
+  }
+
+  function scheduleEnemy() {
+    wait(rand(1.4, 3.2), () => {
+      spawnEnemy();
+      if (alive) scheduleEnemy();
+    });
+  }
+  scheduleEnemy();
+
+  onUpdate("enemy", e => {
+    e.pos.x -= spd * dt();
+    if (e.pos.x < -100) destroy(e);
+  });
+
+  // --- Coins ---
+  function spawnCoin() {
+    if (!alive) return;
+    add([
+      text("🪙", { size: 34 }),
+      pos(W + 60, rand(GY - 220, GY - 90)),
+      anchor("center"),
+      area(),
+      "coin",
+    ]);
+  }
+
+  function scheduleCoin() {
+    wait(rand(0.9, 2.1), () => {
+      spawnCoin();
+      if (alive) scheduleCoin();
+    });
+  }
+  scheduleCoin();
+
+  onUpdate("coin", c => {
+    c.pos.x -= spd * dt();
+    if (c.pos.x < -80) destroy(c);
+  });
+
+  // --- Collisions ---
+  player.onCollide("enemy", () => {
+    if (!alive) return;
+    alive = false;
+    sfx("die");
+    saveHS(Math.floor(score));
+    wait(0.7, () => go("gameover", { score: Math.floor(score) }));
+  });
+
+  player.onCollide("coin", coin => {
+    destroy(coin);
+    score += 10;
+    sfx("coin");
+  });
+
+  // --- Main update ---
+  onUpdate(() => {
+    if (!alive) return;
+    elapsed += dt();
+    spd      = BASE_SPD + elapsed * 22;
+    score   += dt() * 6;
+
+    // Wrap grass tufts
+    for (const t of tufts) {
+      t.pos.x -= spd * dt();
+      if (t.pos.x < -16) t.pos.x += W + 32;
+    }
+
+    scoreTxt.text = "Score: " + Math.floor(score);
+  });
+
+  // --- HUD ---
+  const scoreTxt = add([
+    text("Score: 0", { size: 28, font: "monospace" }),
+    pos(16, 16), fixed(), color(255, 255, 255), z(50),
+  ]);
+
+  add([
+    text("Best: " + getHS(), { size: 20, font: "monospace" }),
+    pos(16, 52), fixed(), color(255, 215, 0), z(50),
+  ]);
+
+  add([
+    text("SPACE / Tap = Jump", { size: 15, font: "monospace" }),
+    pos(W - 16, 16), anchor("topright"), fixed(), color(210, 255, 210), z(50),
+  ]);
+});
+
+// ─── Game Over Scene ─────────────────────────────────────────────────────────
+scene("gameover", ({ score }) => {
+  showMicBtn();
+
+  // Ground
+  add([rect(W, GH + 20), pos(0, GY), color(74, 222, 128)]);
+  add([rect(W, 10),       pos(0, GY), color(34, 197, 94)]);
+
+  const hc = [[52,211,153],[34,197,94],[74,222,128]];
+  for (let i = 0; i < 5; i++) {
+    const c = hc[i % hc.length];
+    add([circle(50 + (i % 3) * 14), pos(80 + i * 185, GY + 14),
+         color(c[0], c[1], c[2]), z(-1)]);
+  }
+
+  add([text("🧙‍♂️", { size: 76 }), pos(W/2, H/2 - 150), anchor("center"), z(5)]);
+
+  const goSz = Math.min(60, W / 10);
+  add([text("GAME  OVER", { size: goSz, font: "monospace" }),
+       pos(W/2, H/2 - 66), anchor("center"), color(255, 70, 70), z(5)]);
+
+  add([text("Score: " + score, { size: 38, font: "monospace" }),
+       pos(W/2, H/2 + 4),  anchor("center"), color(255, 255, 255), z(5)]);
+
+  const hs = getHS();
+  add([text("Best:  " + hs, { size: 28, font: "monospace" }),
+       pos(W/2, H/2 + 54), anchor("center"), color(255, 215, 0), z(5)]);
+
+  if (score >= hs && score > 0) {
+    add([text("🏆  NEW  RECORD!", { size: 24, font: "monospace" }),
+         pos(W/2, H/2 + 100), anchor("center"), color(255, 223, 0), z(5)]);
+  }
+
+  add([text("Tap  or  SPACE  to  Play  Again", { size: 20, font: "monospace" }),
+       pos(W/2, H/2 + 150), anchor("center"), color(240, 240, 80), z(5)]);
+
+  let restarted = false;
+  const restart = () => {
+    if (restarted) return;
+    restarted = true;
+    hideMicBtn();
+    go("game");
+  };
+  onKeyPress("space", restart);
+  onClick(restart);
+});
+
+// ─── Boot ─────────────────────────────────────────────────────────────────────
+go("menu");
+</script>
+</body>
+</html>
